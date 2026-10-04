@@ -29,7 +29,7 @@ jobs:
         run: nuget restore source/PlayniteAchievements.sln
 
       - name: Build (Release)
-        run: msbuild source/PlayniteAchievements.sln /p:Configuration=Release /m
+        run: msbuild source/PlayniteAchievements.csproj /p:Configuration=Release /m
 
       - name: Upload build output
         uses: actions/upload-artifact@v4
