@@ -1,1 +1,225 @@
-
+diff --git a/source/Providers/Local/LocalSavesProvider.cs b/source/Providers/Local/LocalSavesProvider.cs
+index dd3b331..5babd42 100644
+--- a/source/Providers/Local/LocalSavesProvider.cs
++++ b/source/Providers/Local/LocalSavesProvider.cs
+@@ -10,6 +10,7 @@
+ using System.Net.Http.Headers;
+ using System.Text;
+ using System.Text.RegularExpressions;
++using System.Diagnostics;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using System.Xml.Linq;
+@@ -118,6 +119,29 @@ public sealed class LocalAchievementEditResult
+         private readonly AsyncLocal<int> _realtimeLogScopeDepth = new AsyncLocal<int>();
+         private readonly object _discoveryCacheLock = new object();
+         private readonly Dictionary<string, IReadOnlyList<string>> _localFolderCandidatesCache = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
++        // "No folder found" results expire quickly so a save/achievement file created after the first
++        // lookup (for example when the game is first run) is found by the next refresh without restarting Playnite.
++        private readonly Dictionary<string, DateTime> _localFolderEmptyResultUtc = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
++        private static readonly TimeSpan LocalFolderEmptyResultTtl = TimeSpan.FromSeconds(10);
++        // Debug timing: only the first few runs of each search kind are logged.
++        private const int SearchTimingLogLimit = 3;
++        private int _fullSearchTimingLogged;
++
++        private static string FormatOrdinal(int n)
++        {
++            return n == 1 ? "1st" : n == 2 ? "2nd" : n == 3 ? "3rd" : n + "th";
++        }
++
++        private void LogSearchTiming(ref int counter, string kind, long elapsedMs, string detail)
++        {
++            var ordinal = Interlocked.Increment(ref counter);
++            if (ordinal > SearchTimingLogLimit)
++            {
++                return;
++            }
++
++            _logger?.Info($"PlayniteAchievements: {FormatOrdinal(ordinal)} {kind} search run: {elapsedMs}ms ({detail})");
++        }
+         private readonly Dictionary<int, IReadOnlyList<string>> _steamAppCacheSchemaFilePathsCache = new Dictionary<int, IReadOnlyList<string>>();
+         private IReadOnlyList<string> _steamUserdataRootsCache;
+         private IReadOnlyList<string> _steamInstallRootsCache;
+@@ -8221,10 +8245,20 @@ private List<string> FindLocalFolders(string appId)
+             {
+                 if (_localFolderCandidatesCache.TryGetValue(appId, out var cachedFolders))
+                 {
+-                    return cachedFolders.ToList();
++                    var emptyResultExpired = cachedFolders.Count == 0 &&
++                        (!_localFolderEmptyResultUtc.TryGetValue(appId, out var emptySinceUtc) ||
++                         DateTime.UtcNow - emptySinceUtc >= LocalFolderEmptyResultTtl);
++                    if (!emptyResultExpired)
++                    {
++                        return cachedFolders.ToList();
++                    }
++
++                    _localFolderCandidatesCache.Remove(appId);
++                    _localFolderEmptyResultUtc.Remove(appId);
+                 }
+             }
+ 
++            var searchTimer = Stopwatch.StartNew();
+             var folders = new List<string>();
+             var excludedLocalPaths = GetExcludedLocalPathEntries().ToList();
+ 
+@@ -8291,9 +8325,21 @@ private List<string> FindLocalFolders(string appId)
+                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                 .ToList();
+ 
++            searchTimer.Stop();
++            LogSearchTiming(ref _fullSearchTimingLogged, "full", searchTimer.ElapsedMilliseconds,
++                $"appId={appId}, folders found={resolvedFolders.Count}");
++
+             lock (_discoveryCacheLock)
+             {
+                 _localFolderCandidatesCache[appId] = resolvedFolders;
++                if (resolvedFolders.Count == 0)
++                {
++                    _localFolderEmptyResultUtc[appId] = DateTime.UtcNow;
++                }
++                else
++                {
++                    _localFolderEmptyResultUtc.Remove(appId);
++                }
+             }
+ 
+             return resolvedFolders.ToList();
+diff --git a/source/Services/InGameAchievementMonitor.cs b/source/Services/InGameAchievementMonitor.cs
+index 73a193b..d4a9977 100644
+--- a/source/Services/InGameAchievementMonitor.cs
++++ b/source/Services/InGameAchievementMonitor.cs
+@@ -27,6 +27,9 @@ namespace PlayniteAchievements.Services
+     internal sealed class InGameAchievementMonitor : IDisposable
+     {
+         private const int StartupDelaySeconds = 20;
++        // A game with no resolvable provider at launch (for example a Local game whose achievement file
++        // is only created during its first run) keeps retrying the normal provider resolution while it runs.
++        private static readonly TimeSpan ActivationRetryInterval = TimeSpan.FromSeconds(15);
+         private static readonly TimeSpan SchedulerResolution = TimeSpan.FromMilliseconds(100);
+         private static readonly TimeSpan FileDebounce = TimeSpan.FromMilliseconds(150);
+         private static readonly TimeSpan ConfiguredLogInterval = TimeSpan.FromMinutes(5);
+@@ -277,8 +280,52 @@ await _refreshRuntime
+                 return;
+             }
+ 
+-            Stop(game);
+-            _logger?.Info($"[InGameMonitor] Skipped: no authenticated provider for '{game.Name}'.");
++            // Nothing resolves yet. The achievement file may only appear while the game is running,
++            // so keep watching for the rest of the session. Stop(game) cancels the session token.
++            _logger?.Info($"[InGameMonitor] No provider for '{game.Name}' yet; will keep checking while the game is running.");
++            while (true)
++            {
++                try
++                {
++                    await Task.Delay(ActivationRetryInterval, state.SessionToken).ConfigureAwait(false);
++                }
++                catch (OperationCanceledException)
++                {
++                    return;
++                }
++
++                lock (_stateLock)
++                {
++                    if (!_games.TryGetValue(game.Id, out var currentState) ||
++                        !ReferenceEquals(state, currentState))
++                    {
++                        return;
++                    }
++                }
++
++                var activated = false;
++                try
++                {
++                    activated = TryActivate(state);
++                }
++                catch (Exception ex)
++                {
++                    _logger?.Debug(ex, $"[InGameMonitor] Activation check failed for {game.Name}.");
++                }
++
++                if (activated)
++                {
++                    lock (_stateLock)
++                    {
++                        var now = CaptureTimelineClock.UtcNow;
++                        state.NextFallbackDueUtc = now.AddSeconds(StartupDelaySeconds);
++                        state.NextFriendDueUtc = now.AddSeconds(StartupDelaySeconds).Add(GetFriendInterval());
++                    }
++
++                    _logger?.Info($"[InGameMonitor] Provider became available for '{game.Name}' during the session.");
++                    return;
++                }
++            }
+         }
+ 
+         public void Stop(Game game)
+diff --git a/source/Services/NotificationPublisher.cs b/source/Services/NotificationPublisher.cs
+index cc9f508..5b01957 100644
+--- a/source/Services/NotificationPublisher.cs
++++ b/source/Services/NotificationPublisher.cs
+@@ -7555,6 +7555,8 @@ private sealed class NotificationScoreContext
+             public string AchievementCategory { get; set; } = string.Empty;
+             public int GamePoints { get; set; }
+             public int GamePointsTotal { get; set; }
++            public int GameUnlockedCount { get; set; }
++            public int GameAchievementCount { get; set; }
+             public int TotalPoints { get; set; }
+         }
+ 
+@@ -7588,6 +7590,8 @@ private static bool IsNotificationScoreToken(string token)
+                 case "category":
+                 case "gamepoints":
+                 case "gamepointstotal":
++                case "gameunlockedcount":
++                case "gameachievementcount":
+                 case "totalpoints":
+                     return true;
+                 default:
+@@ -7677,6 +7681,12 @@ private static string ResolveNotificationScoreToken(string token, Game game, str
+                 case "gamepointstotal":
+                     value = scores.GamePointsTotal;
+                     break;
++                case "gameunlockedcount":
++                    value = scores.GameUnlockedCount;
++                    break;
++                case "gameachievementcount":
++                    value = scores.GameAchievementCount;
++                    break;
+                 case "totalpoints":
+                     value = scores.TotalPoints;
+                     break;
+@@ -7849,6 +7859,8 @@ private static void PopulateGameNotificationScores(NotificationScoreContext cont
+             context.GamePrestigeScoreTotal = SumNotificationValues(achievements.Where(item => item != null).Select(item => item.PrestigeScore));
+             context.GamePoints = SumNotificationPoints(unlocked);
+             context.GamePointsTotal = SumNotificationPoints(achievements);
++            context.GameUnlockedCount = unlocked.Count;
++            context.GameAchievementCount = achievements.Count(item => item != null);
+         }
+ 
+         private static int SumNotificationPoints(IEnumerable<AchievementDetail> achievements)
+diff --git a/source/Views/LegacyNotificationSettingsControl.xaml b/source/Views/LegacyNotificationSettingsControl.xaml
+index 7d14cde..571617d 100644
+--- a/source/Views/LegacyNotificationSettingsControl.xaml
++++ b/source/Views/LegacyNotificationSettingsControl.xaml
+@@ -3401,6 +3401,8 @@
+                                                              <WrapPanel Margin="0,0,0,6">
+                                                              <Button Content="&lt;gamePoints&gt;" Tag="&lt;gamePoints&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
+                                                              <Button Content="&lt;gamePointsTotal&gt;" Tag="&lt;gamePointsTotal&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
++                                                             <Button Content="&lt;gameUnlockedCount&gt;" Tag="&lt;gameUnlockedCount&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
++                                                             <Button Content="&lt;gameAchievementCount&gt;" Tag="&lt;gameAchievementCount&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
+                                                              <Button Content="&lt;totalPoints&gt;" Tag="&lt;totalPoints&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
+                                                              </WrapPanel>
+ 
+diff --git a/tools/notification-template-builder.html b/tools/notification-template-builder.html
+index 2fd8238..61c77c3 100644
+--- a/tools/notification-template-builder.html
++++ b/tools/notification-template-builder.html
+@@ -1065,7 +1065,7 @@
+         '<prestigeExp>', '<prestigeExpTotal>', '<prestigeExpUntilNextLevel>',
+         '<prestigeNextTier>', '<prestigeExpUntilNextTier>'
+       ]},
+-      { label: 'Points', tokens: ['<gamePoints>', '<gamePointsTotal>', '<totalPoints>'] },
++      { label: 'Points', tokens: ['<gamePoints>', '<gamePointsTotal>', '<gameUnlockedCount>', '<gameAchievementCount>', '<totalPoints>'] },
+       { label: 'Context', tokens: ['<provider>', '<source>', '<date>', '<time>', '<dateTime>'] }
+     ];
+ 
