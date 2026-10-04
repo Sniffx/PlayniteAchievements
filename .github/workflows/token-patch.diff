@@ -1,0 +1,118 @@
+diff --git a/source/Providers/Local/LocalSavesProvider.cs b/source/Providers/Local/LocalSavesProvider.cs
+index dd3b331..cb5877b 100644
+--- a/source/Providers/Local/LocalSavesProvider.cs
++++ b/source/Providers/Local/LocalSavesProvider.cs
+@@ -118,6 +118,10 @@ public sealed class LocalAchievementEditResult
+         private readonly AsyncLocal<int> _realtimeLogScopeDepth = new AsyncLocal<int>();
+         private readonly object _discoveryCacheLock = new object();
+         private readonly Dictionary<string, IReadOnlyList<string>> _localFolderCandidatesCache = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
++        // "No folder found" results expire quickly so a save/achievement file created after the first
++        // lookup (for example when the game is first run) is found by the next refresh without restarting Playnite.
++        private readonly Dictionary<string, DateTime> _localFolderEmptyResultUtc = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
++        private static readonly TimeSpan LocalFolderEmptyResultTtl = TimeSpan.FromSeconds(10);
+         private readonly Dictionary<int, IReadOnlyList<string>> _steamAppCacheSchemaFilePathsCache = new Dictionary<int, IReadOnlyList<string>>();
+         private IReadOnlyList<string> _steamUserdataRootsCache;
+         private IReadOnlyList<string> _steamInstallRootsCache;
+@@ -8221,7 +8225,16 @@ private List<string> FindLocalFolders(string appId)
+             {
+                 if (_localFolderCandidatesCache.TryGetValue(appId, out var cachedFolders))
+                 {
+-                    return cachedFolders.ToList();
++                    var emptyResultExpired = cachedFolders.Count == 0 &&
++                        (!_localFolderEmptyResultUtc.TryGetValue(appId, out var emptySinceUtc) ||
++                         DateTime.UtcNow - emptySinceUtc >= LocalFolderEmptyResultTtl);
++                    if (!emptyResultExpired)
++                    {
++                        return cachedFolders.ToList();
++                    }
++
++                    _localFolderCandidatesCache.Remove(appId);
++                    _localFolderEmptyResultUtc.Remove(appId);
+                 }
+             }
+ 
+@@ -8294,6 +8307,14 @@ private List<string> FindLocalFolders(string appId)
+             lock (_discoveryCacheLock)
+             {
+                 _localFolderCandidatesCache[appId] = resolvedFolders;
++                if (resolvedFolders.Count == 0)
++                {
++                    _localFolderEmptyResultUtc[appId] = DateTime.UtcNow;
++                }
++                else
++                {
++                    _localFolderEmptyResultUtc.Remove(appId);
++                }
+             }
+ 
+             return resolvedFolders.ToList();
+diff --git a/source/Services/NotificationPublisher.cs b/source/Services/NotificationPublisher.cs
+index cc9f508..5b01957 100644
+--- a/source/Services/NotificationPublisher.cs
++++ b/source/Services/NotificationPublisher.cs
+@@ -7555,6 +7555,8 @@ private sealed class NotificationScoreContext
+             public string AchievementCategory { get; set; } = string.Empty;
+             public int GamePoints { get; set; }
+             public int GamePointsTotal { get; set; }
++            public int GameUnlockedCount { get; set; }
++            public int GameAchievementCount { get; set; }
+             public int TotalPoints { get; set; }
+         }
+ 
+@@ -7588,6 +7590,8 @@ private static bool IsNotificationScoreToken(string token)
+                 case "category":
+                 case "gamepoints":
+                 case "gamepointstotal":
++                case "gameunlockedcount":
++                case "gameachievementcount":
+                 case "totalpoints":
+                     return true;
+                 default:
+@@ -7677,6 +7681,12 @@ private static string ResolveNotificationScoreToken(string token, Game game, str
+                 case "gamepointstotal":
+                     value = scores.GamePointsTotal;
+                     break;
++                case "gameunlockedcount":
++                    value = scores.GameUnlockedCount;
++                    break;
++                case "gameachievementcount":
++                    value = scores.GameAchievementCount;
++                    break;
+                 case "totalpoints":
+                     value = scores.TotalPoints;
+                     break;
+@@ -7849,6 +7859,8 @@ private static void PopulateGameNotificationScores(NotificationScoreContext cont
+             context.GamePrestigeScoreTotal = SumNotificationValues(achievements.Where(item => item != null).Select(item => item.PrestigeScore));
+             context.GamePoints = SumNotificationPoints(unlocked);
+             context.GamePointsTotal = SumNotificationPoints(achievements);
++            context.GameUnlockedCount = unlocked.Count;
++            context.GameAchievementCount = achievements.Count(item => item != null);
+         }
+ 
+         private static int SumNotificationPoints(IEnumerable<AchievementDetail> achievements)
+diff --git a/source/Views/LegacyNotificationSettingsControl.xaml b/source/Views/LegacyNotificationSettingsControl.xaml
+index 7d14cde..571617d 100644
+--- a/source/Views/LegacyNotificationSettingsControl.xaml
++++ b/source/Views/LegacyNotificationSettingsControl.xaml
+@@ -3401,6 +3401,8 @@
+                                                              <WrapPanel Margin="0,0,0,6">
+                                                              <Button Content="&lt;gamePoints&gt;" Tag="&lt;gamePoints&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
+                                                              <Button Content="&lt;gamePointsTotal&gt;" Tag="&lt;gamePointsTotal&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
++                                                             <Button Content="&lt;gameUnlockedCount&gt;" Tag="&lt;gameUnlockedCount&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
++                                                             <Button Content="&lt;gameAchievementCount&gt;" Tag="&lt;gameAchievementCount&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
+                                                              <Button Content="&lt;totalPoints&gt;" Tag="&lt;totalPoints&gt;" Click="NotificationTemplateToken_Click" Margin="0,0,6,6"/>
+                                                              </WrapPanel>
+ 
+diff --git a/tools/notification-template-builder.html b/tools/notification-template-builder.html
+index 2fd8238..61c77c3 100644
+--- a/tools/notification-template-builder.html
++++ b/tools/notification-template-builder.html
+@@ -1065,7 +1065,7 @@
+         '<prestigeExp>', '<prestigeExpTotal>', '<prestigeExpUntilNextLevel>',
+         '<prestigeNextTier>', '<prestigeExpUntilNextTier>'
+       ]},
+-      { label: 'Points', tokens: ['<gamePoints>', '<gamePointsTotal>', '<totalPoints>'] },
++      { label: 'Points', tokens: ['<gamePoints>', '<gamePointsTotal>', '<gameUnlockedCount>', '<gameAchievementCount>', '<totalPoints>'] },
+       { label: 'Context', tokens: ['<provider>', '<source>', '<date>', '<time>', '<dateTime>'] }
+     ];
+ 
